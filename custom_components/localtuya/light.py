@@ -1,21 +1,19 @@
 """Platform to locally control Tuya-based light devices."""
 import logging
 import textwrap
+from dataclasses import dataclass
 from functools import partial
 
 import homeassistant.util.color as color_util
 import voluptuous as vol
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
-    ATTR_COLOR_TEMP,
     ATTR_EFFECT,
     ATTR_HS_COLOR,
     DOMAIN,
-    SUPPORT_BRIGHTNESS,
-    SUPPORT_COLOR,
-    SUPPORT_COLOR_TEMP,
-    SUPPORT_EFFECT,
     LightEntity,
+    LightEntityFeature,
+    ColorMode,
 )
 from homeassistant.const import CONF_BRIGHTNESS, CONF_COLOR_TEMP, CONF_SCENE
 
@@ -28,7 +26,7 @@ from .const import (
     CONF_COLOR_TEMP_MAX_KELVIN,
     CONF_COLOR_TEMP_MIN_KELVIN,
     CONF_COLOR_TEMP_REVERSE,
-    CONF_MUSIC_MODE,
+    CONF_MUSIC_MODE, CONF_COLOR_MODE_SET,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,9 +36,21 @@ DEFAULT_MAX_KELVIN = 6500  # MIRED 153
 
 DEFAULT_COLOR_TEMP_REVERSE = False
 
-DEFAULT_LOWER_BRIGHTNESS = 29
+DEFAULT_LOWER_BRIGHTNESS = 10
 DEFAULT_UPPER_BRIGHTNESS = 1000
 
+# Default DPs for Tuya lights.
+# Source:
+#   https://developer.tuya.com/en/docs/iot/product-function-definition?id=K9s9rhj576ypf
+DEFAULT_DP = {
+    CONF_BRIGHTNESS: 22,
+    CONF_COLOR_TEMP: 23,
+    CONF_COLOR_MODE: 21,
+    CONF_COLOR: 24,
+    CONF_SCENE: 25,
+}
+
+MODE_MANUAL = "manual"
 MODE_COLOR = "colour"
 MODE_MUSIC = "music"
 MODE_SCENE = "scene"
@@ -48,6 +58,8 @@ MODE_WHITE = "white"
 
 SCENE_CUSTOM = "Custom"
 SCENE_MUSIC = "Music"
+
+MODES_SET = {"Colour, Music, Scene and White": 0, "Manual, Music, Scene and White": 1}
 
 SCENE_LIST_RGBW_1000 = {
     "Night": "000e0d0000000000000000c80000",
@@ -91,6 +103,22 @@ SCENE_LIST_RGB_1000 = {
     + "0000000",
 }
 
+@dataclass(frozen=True)
+class Mode:
+    color: str = MODE_COLOR
+    music: str = MODE_MUSIC
+    scene: str = MODE_SCENE
+    white: str = MODE_WHITE
+
+    def as_list(self) -> list:
+        return [self.color, self.music, self.scene, self.white]
+
+    def as_dict(self) -> dict[str, str]:
+        default = {"Default": self.white}
+        return {**default, "Mode Color": self.color, "Mode Scene": self.scene}
+
+MAP_MODE_SET = {0: Mode(), 1: Mode(color=MODE_MANUAL)}
+
 
 def map_range(value, from_lower, from_upper, to_lower, to_upper):
     """Map a value in one range to another."""
@@ -103,16 +131,16 @@ def map_range(value, from_lower, from_upper, to_lower, to_upper):
 def flow_schema(dps):
     """Return schema used in config flow."""
     return {
-        vol.Optional(CONF_BRIGHTNESS): vol.In(dps),
-        vol.Optional(CONF_COLOR_TEMP): vol.In(dps),
+        _optional_with_default(CONF_BRIGHTNESS, dps): vol.In(dps),
+        _optional_with_default(CONF_COLOR_TEMP, dps): vol.In(dps),
         vol.Optional(CONF_BRIGHTNESS_LOWER, default=DEFAULT_LOWER_BRIGHTNESS): vol.All(
             vol.Coerce(int), vol.Range(min=0, max=10000)
         ),
         vol.Optional(CONF_BRIGHTNESS_UPPER, default=DEFAULT_UPPER_BRIGHTNESS): vol.All(
             vol.Coerce(int), vol.Range(min=0, max=10000)
         ),
-        vol.Optional(CONF_COLOR_MODE): vol.In(dps),
-        vol.Optional(CONF_COLOR): vol.In(dps),
+        _optional_with_default(CONF_COLOR_MODE, dps): vol.In(dps),
+        _optional_with_default(CONF_COLOR, dps): vol.In(dps),
         vol.Optional(CONF_COLOR_TEMP_MIN_KELVIN, default=DEFAULT_MIN_KELVIN): vol.All(
             vol.Coerce(int), vol.Range(min=1500, max=8000)
         ),
@@ -124,11 +152,37 @@ def flow_schema(dps):
             default=DEFAULT_COLOR_TEMP_REVERSE,
             description={"suggested_value": DEFAULT_COLOR_TEMP_REVERSE},
         ): bool,
-        vol.Optional(CONF_SCENE): vol.In(dps),
+        _optional_with_default(CONF_SCENE, dps): vol.In(dps),
         vol.Optional(
             CONF_MUSIC_MODE, default=False, description={"suggested_value": False}
         ): bool,
     }
+
+
+def _optional_with_default(name, dps):
+    """
+    Return a schema Optional with the provided name and a default value.
+
+    The default value is based on the provided actual device DPs.
+    The DPs must be strings of the form "DP (value: ...)".
+    """
+    if name in DEFAULT_DP and dps is not None:
+        default = _lookup_dp(DEFAULT_DP[name], dps) or vol.UNDEFINED
+        return vol.Optional(name, default=default)
+
+    return vol.Optional(name)
+
+
+def _lookup_dp(dp, dps):
+    """
+    Find the provided DP in the list of actual device DPs.
+
+    If not found returns None.
+    The DPs must be strings of the form "DP (value: ...)".
+    """
+    return next(
+        filter(lambda x: isinstance(x, str) and x.startswith(f"{dp} "), dps), None
+    )
 
 
 class LocaltuyaLight(LocalTuyaEntity, LightEntity):
@@ -162,10 +216,12 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         self._color_temp_reverse = self._config.get(
             CONF_COLOR_TEMP_REVERSE, DEFAULT_COLOR_TEMP_REVERSE
         )
+        self._modes = MAP_MODE_SET[int(self._config.get(CONF_COLOR_MODE_SET, 0))]
         self._hs = None
         self._effect = None
         self._effect_list = []
-        self._scenes = None
+        self._scenes = {}
+
         if self.has_config(CONF_SCENE):
             if self._config.get(CONF_SCENE) < 20:
                 self._scenes = SCENE_LIST_RGBW_255
@@ -174,6 +230,7 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
             else:
                 self._scenes = SCENE_LIST_RGBW_1000
             self._effect_list = list(self._scenes.keys())
+
         if self._config.get(CONF_MUSIC_MODE):
             self._effect_list.append(SCENE_MUSIC)
 
@@ -197,8 +254,8 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         if self.is_color_mode:
             return self._hs
         if (
-            self.supported_features & SUPPORT_COLOR
-            and not self.supported_features & SUPPORT_COLOR_TEMP
+                ColorMode.HS in self.supported_color_modes
+                and not ColorMode.COLOR_TEMP in self.supported_color_modes
         ):
             return [0, 0]
         return None
@@ -241,45 +298,76 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
     @property
     def effect_list(self):
         """Return the list of supported effects for this light."""
-        return self._effect_list
+        if self.is_scene_mode or self.is_music_mode:
+            return self._effect
+        elif (color_mode := self.__get_color_mode()) in self._scenes.values():
+            return self.__find_scene_by_scene_data(color_mode)
+        return None
 
     @property
-    def supported_features(self):
-        """Flag supported features."""
-        supports = 0
-        if self.has_config(CONF_BRIGHTNESS):
-            supports |= SUPPORT_BRIGHTNESS
+    def supported_color_modes(self) -> set[ColorMode] | set[str] | None:
+        """Flag supported color modes."""
+        color_modes: set[ColorMode] = set()
+
         if self.has_config(CONF_COLOR_TEMP):
-            supports |= SUPPORT_COLOR_TEMP
+            color_modes.add(ColorMode.COLOR_TEMP)
         if self.has_config(CONF_COLOR):
-            supports |= SUPPORT_COLOR | SUPPORT_BRIGHTNESS
+            color_modes.add(ColorMode.HS)
+
+        if not color_modes and self.has_config(CONF_BRIGHTNESS):
+            return {ColorMode.BRIGHTNESS}
+
+        if not color_modes:
+            return {ColorMode.ONOFF}
+
+        return color_modes
+
+    @property
+    def supported_features(self) -> LightEntityFeature:
+        """Flag supported features."""
+        supports = LightEntityFeature(0)
         if self.has_config(CONF_SCENE) or self.has_config(CONF_MUSIC_MODE):
-            supports |= SUPPORT_EFFECT
+            supports |= LightEntityFeature.EFFECT
         return supports
+
+    @property
+    def color_mode(self) -> ColorMode:
+        """Return the color_mode of the light."""
+        if len(self.supported_color_modes) == 1:
+            return next(iter(self.supported_color_modes))
+
+        if self.is_color_mode:
+            return ColorMode.HS
+        if self.is_white_mode:
+            return ColorMode.COLOR_TEMP
+        if self._brightness:
+            return ColorMode.BRIGHTNESS
+
+        return ColorMode.ONOFF
 
     @property
     def is_white_mode(self):
         """Return true if the light is in white mode."""
         color_mode = self.__get_color_mode()
-        return color_mode is None or color_mode == MODE_WHITE
+        return color_mode is None or color_mode == self._modes.white
 
     @property
     def is_color_mode(self):
         """Return true if the light is in color mode."""
         color_mode = self.__get_color_mode()
-        return color_mode is not None and color_mode == MODE_COLOR
+        return color_mode is not None and color_mode == self._modes.color
 
     @property
     def is_scene_mode(self):
         """Return true if the light is in scene mode."""
         color_mode = self.__get_color_mode()
-        return color_mode is not None and color_mode.startswith(MODE_SCENE)
+        return color_mode is not None and color_mode.startswith(self._modes.scene)
 
     @property
     def is_music_mode(self):
         """Return true if the light is in music mode."""
         color_mode = self.__get_color_mode()
-        return color_mode is not None and color_mode == MODE_MUSIC
+        return color_mode is not None and color_mode == self._modes.music
 
     def __is_color_rgb_encoded(self):
         return len(self.dps_conf(CONF_COLOR)) > 12
@@ -294,7 +382,7 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         return (
             self.dps_conf(CONF_COLOR_MODE)
             if self.has_config(CONF_COLOR_MODE)
-            else MODE_WHITE
+            else self._modes.white
         )
 
     async def async_turn_on(self, **kwargs):
@@ -304,7 +392,7 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
             states[self._dp_id] = True
         features = self.supported_features
         brightness = None
-        if ATTR_EFFECT in kwargs and (features & SUPPORT_EFFECT):
+        if ATTR_EFFECT in kwargs and (features & LightEntityFeature.EFFECT):
             scene = self._scenes.get(kwargs[ATTR_EFFECT])
             if scene is not None:
                 if scene.startswith(MODE_SCENE):
@@ -315,7 +403,11 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
             elif kwargs[ATTR_EFFECT] == SCENE_MUSIC:
                 states[self._config.get(CONF_COLOR_MODE)] = MODE_MUSIC
 
-        if ATTR_BRIGHTNESS in kwargs and (features & SUPPORT_BRIGHTNESS):
+        if ATTR_BRIGHTNESS in kwargs and (
+            ColorMode.BRIGHTNESS in self.supported_color_modes
+            or self.has_config(CONF_BRIGHTNESS)
+            or self.has_config(CONF_COLOR)
+        ):
             brightness = map_range(
                 int(kwargs[ATTR_BRIGHTNESS]),
                 0,
@@ -347,7 +439,7 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
                 states[self._config.get(CONF_COLOR)] = color
                 states[self._config.get(CONF_COLOR_MODE)] = MODE_COLOR
 
-        if ATTR_HS_COLOR in kwargs and (features & SUPPORT_COLOR):
+        if ATTR_HS_COLOR in kwargs and ColorMode.HS in self.supported_color_modes:
             if brightness is None:
                 brightness = self._brightness
             hs = kwargs[ATTR_HS_COLOR]
@@ -374,10 +466,10 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
                 states[self._config.get(CONF_COLOR)] = color
                 states[self._config.get(CONF_COLOR_MODE)] = MODE_COLOR
 
-        if ATTR_COLOR_TEMP in kwargs and (features & SUPPORT_COLOR_TEMP):
+        if ColorMode.COLOR_TEMP in kwargs and ColorMode.COLOR_TEMP in self.supported_color_modes:
             if brightness is None:
                 brightness = self._brightness
-            mired = int(kwargs[ATTR_COLOR_TEMP])
+            mired = int(kwargs[ColorMode.COLOR_TEMP])
             if self._color_temp_reverse:
                 mired = self._max_mired - (mired - self._min_mired)
             if mired < self._min_mired:
@@ -403,10 +495,14 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
         self._state = self.dps(self._dp_id)
         supported = self.supported_features
         self._effect = None
-        if supported & SUPPORT_BRIGHTNESS and self.has_config(CONF_BRIGHTNESS):
+
+        if (ColorMode.BRIGHTNESS in self.supported_color_modes
+            or self.has_config(CONF_BRIGHTNESS)
+            or self.has_config(CONF_COLOR)
+        ):
             self._brightness = self.dps_conf(CONF_BRIGHTNESS)
 
-        if supported & SUPPORT_COLOR:
+        if ColorMode.HS in self.supported_color_modes:
             color = self.dps_conf(CONF_COLOR)
             if color is not None and not self.is_white_mode:
                 if self.__is_color_rgb_encoded():
@@ -422,10 +518,10 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
                     self._hs = [hue, sat / 10.0]
                     self._brightness = value
 
-        if supported & SUPPORT_COLOR_TEMP:
+        if ColorMode.COLOR_TEMP in self.supported_color_modes:
             self._color_temp = self.dps_conf(CONF_COLOR_TEMP)
 
-        if self.is_scene_mode and supported & SUPPORT_EFFECT:
+        if self.is_scene_mode and supported & LightEntityFeature.EFFECT:
             if self.dps_conf(CONF_COLOR_MODE) != MODE_SCENE:
                 self._effect = self.__find_scene_by_scene_data(
                     self.dps_conf(CONF_COLOR_MODE)
@@ -440,7 +536,7 @@ class LocaltuyaLight(LocalTuyaEntity, LightEntity):
                 elif SCENE_CUSTOM in self._effect_list:
                     self._effect_list.remove(SCENE_CUSTOM)
 
-        if self.is_music_mode and supported & SUPPORT_EFFECT:
+        if self.is_music_mode and supported & LightEntityFeature.EFFECT:
             self._effect = SCENE_MUSIC
 
 

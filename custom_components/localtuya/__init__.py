@@ -18,7 +18,6 @@ from homeassistant.const import (
     CONF_ID,
     CONF_PLATFORM,
     CONF_REGION,
-    CONF_USERNAME,
     EVENT_HOMEASSISTANT_STOP,
     SERVICE_RELOAD,
 )
@@ -26,13 +25,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.service import async_register_admin_service
 
-from .cloud_api import TuyaCloudApi
+from .cloud_api import CloudApi
 from .common import TuyaDevice, async_config_entry_by_device_id
 from .config_flow import ENTRIES_VERSION, config_schema
 from .const import (
     ATTR_UPDATED_AT,
+    CLOUD_TYPE_NONE,
+    CLOUD_TYPE_IOT,
     CONF_NO_CLOUD,
+    CONF_CLOUD_TYPE,
+    CONF_OEM_EMAIL,
+    CONF_OEM_PASSWORD,
     CONF_PRODUCT_KEY,
     CONF_USER_ID,
     DATA_CLOUD,
@@ -139,15 +144,16 @@ async def async_setup(hass: HomeAssistant, config: dict):
             )
             new_data[ATTR_UPDATED_AT] = str(int(time.time() * 1000))
             hass.config_entries.async_update_entry(entry, data=new_data)
-            device = hass.data[DOMAIN][TUYA_DEVICES][device_id]
-            if not device.connected:
-                device.async_connect()
-        elif device_id in hass.data[DOMAIN][TUYA_DEVICES]:
-            # _LOGGER.debug("Device %s found with IP %s", device_id, device_ip)
 
-            device = hass.data[DOMAIN][TUYA_DEVICES][device_id]
-            if not device.connected:
-                device.async_connect()
+        elif device_id in hass.data[DOMAIN][TUYA_DEVICES]:
+            _LOGGER.debug("Device %s found with IP %s", device_id, device_ip)
+
+        device = hass.data[DOMAIN][TUYA_DEVICES].get(device_id)
+        if not device:
+            _LOGGER.warning(f"Could not find device for device_id {device_id}")
+        elif not device.connected:
+            device.async_connect()
+
 
     def _shutdown(event):
         """Clean up resources when shutting down."""
@@ -161,13 +167,14 @@ async def async_setup(hass: HomeAssistant, config: dict):
 
     async_track_time_interval(hass, _async_reconnect, RECONNECT_INTERVAL)
 
-    hass.helpers.service.async_register_admin_service(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_RELOAD,
         _handle_reload,
     )
 
-    hass.helpers.service.async_register_admin_service(
+    hass.services.async_register(
         DOMAIN, SERVICE_SET_DP, _handle_set_dp, schema=SERVICE_SET_DP_SCHEMA
     )
 
@@ -191,15 +198,17 @@ async def async_migrate_entry(hass, config_entry: ConfigEntry):
 
         if config_entry.entry_id == stored_entries[0].entry_id:
             _LOGGER.debug(
-                "Migrating the first config entry (%s)", config_entry.entry_id
+                "Migrating the first config entry (%s) from version 1",
+                config_entry.entry_id,
             )
             new_data = {}
             new_data[CONF_REGION] = "eu"
             new_data[CONF_CLIENT_ID] = ""
             new_data[CONF_CLIENT_SECRET] = ""
             new_data[CONF_USER_ID] = ""
-            new_data[CONF_USERNAME] = DOMAIN
-            new_data[CONF_NO_CLOUD] = True
+            new_data[CONF_OEM_EMAIL] = ""
+            new_data[CONF_OEM_PASSWORD] = ""
+            new_data[CONF_CLOUD_TYPE] = CLOUD_TYPE_NONE
             new_data[CONF_DEVICES] = {
                 config_entry.data[CONF_DEVICE_ID]: config_entry.data.copy()
             }
@@ -210,7 +219,8 @@ async def async_migrate_entry(hass, config_entry: ConfigEntry):
             )
         else:
             _LOGGER.debug(
-                "Merging the config entry %s into the main one", config_entry.entry_id
+                "Merging the config entry %s into the main one from version 1",
+                config_entry.entry_id,
             )
             new_data = stored_entries[0].data.copy()
             new_data[CONF_DEVICES].update(
@@ -219,6 +229,23 @@ async def async_migrate_entry(hass, config_entry: ConfigEntry):
             new_data[ATTR_UPDATED_AT] = str(int(time.time() * 1000))
             hass.config_entries.async_update_entry(stored_entries[0], data=new_data)
             await hass.config_entries.async_remove(config_entry.entry_id)
+    elif config_entry.version == 2:
+        _LOGGER.debug(
+            "Migrating config entry (%s) from version 2", config_entry.entry_id
+        )
+        new_data = config_entry.data.copy()
+        del new_data[CONF_NO_CLOUD]
+        new_data[CONF_OEM_EMAIL] = ""
+        new_data[CONF_OEM_PASSWORD] = ""
+        cloud_type = CLOUD_TYPE_NONE
+        if not config_entry.data[CONF_NO_CLOUD]:
+            cloud_type = CLOUD_TYPE_IOT
+        new_data[CONF_CLOUD_TYPE] = cloud_type
+        new_data[ATTR_UPDATED_AT] = str(int(time.time() * 1000))
+        config_entry.version = new_version
+        hass.config_entries.async_update_entry(
+            config_entry, title=DOMAIN, data=new_data
+        )
 
     _LOGGER.info(
         "Entry %s successfully migrated to version %s.",
@@ -239,42 +266,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         )
         return
 
-    region = entry.data[CONF_REGION]
-    client_id = entry.data[CONF_CLIENT_ID]
-    secret = entry.data[CONF_CLIENT_SECRET]
-    user_id = entry.data[CONF_USER_ID]
-    tuya_api = TuyaCloudApi(hass, region, client_id, secret, user_id)
-    no_cloud = True
-    if CONF_NO_CLOUD in entry.data:
-        no_cloud = entry.data.get(CONF_NO_CLOUD)
-    if no_cloud:
-        _LOGGER.info("Cloud API account not configured.")
-        # wait 1 second to make sure possible migration has finished
-        await asyncio.sleep(1)
-    else:
-        res = await tuya_api.async_get_access_token()
-        if res != "ok":
-            _LOGGER.error("Cloud API connection failed: %s", res)
-        _LOGGER.info("Cloud API connection succeeded.")
-        res = await tuya_api.async_get_devices_list()
+    # wait 1 second to make sure possible migration has finished
+    await asyncio.sleep(1)
+
+    tuya_api = CloudApi.create_api(hass, entry.data)
+    res = await tuya_api.async_authenticate()
+    if res == "ok":
+        await tuya_api.async_fetch_device_list()
+
     hass.data[DOMAIN][DATA_CLOUD] = tuya_api
 
-    async def setup_entities(device_ids):
-        platforms = set()
-        for dev_id in device_ids:
-            entities = entry.data[CONF_DEVICES][dev_id][CONF_ENTITIES]
-            platforms = platforms.union(
-                set(entity[CONF_PLATFORM] for entity in entities)
-            )
-            hass.data[DOMAIN][TUYA_DEVICES][dev_id] = TuyaDevice(hass, entry, dev_id)
-
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_setup(entry, platform)
-                for platform in platforms
-            ]
+    platforms = set()
+    for dev_id in entry.data[CONF_DEVICES].keys():
+        entities = entry.data[CONF_DEVICES][dev_id][CONF_ENTITIES]
+        platforms = platforms.union(
+            set(entity[CONF_PLATFORM] for entity in entities)
         )
+        hass.data[DOMAIN][TUYA_DEVICES][dev_id] = TuyaDevice(hass, entry, dev_id)
 
+    # Setup all platforms at once, letting HA handling each platform and avoiding
+    # potential integration restarts while elements are still initialising.
+    await hass.config_entries.async_forward_entry_setups(entry, platforms)
+
+    async def setup_entities(device_ids):
         for dev_id in device_ids:
             hass.data[DOMAIN][TUYA_DEVICES][dev_id].async_connect()
 
